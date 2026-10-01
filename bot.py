@@ -70,16 +70,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 selected_model = parsed_model
             user_text = clean_text.lstrip()
 
+        # Fallback candidates (OpenRouter enforces max 3 models total)
+        fallback_pool = [
+            "deepseek/deepseek-r1:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "openrouter/free"
+        ]
+        fallbacks = [m for m in fallback_pool if m != selected_model][:2]
+
         response = await ai_client.chat.completions.create(
             model=selected_model,
-            extra_body={
-                "models": [
-                    "deepseek/deepseek-r1:free",
-                    "meta-llama/llama-3.3-70b-instruct:free",
-                    "z-ai/glm-5.3-flash",
-                    "openrouter/free"
-                ]
-            },
+            extra_body={"models": fallbacks} if fallbacks else {},
             messages=[{"role": "user", "content": user_text}],
             stream=False
         )
