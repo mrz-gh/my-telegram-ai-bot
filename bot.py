@@ -60,14 +60,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_text = update.message.text
     status_msg = await update.message.reply_text("Thinking...")
-
     try:
+        # Check if a runtime model was specified via [MODEL:vendor/model] tag
+        selected_model = os.getenv("AI_MODEL", "deepseek/deepseek-r1:free")
+        if user_text.startswith("[MODEL:") and "]" in user_text:
+            tag, clean_text = user_text.split("]", 1)
+            parsed_model = tag.replace("[MODEL:", "").strip()
+            if parsed_model:
+                selected_model = parsed_model
+            user_text = clean_text.lstrip()
+
         response = await ai_client.chat.completions.create(
-            model="stealth/ox-alpha",
+            model=selected_model,
             extra_body={
                 "models": [
                     "deepseek/deepseek-r1:free",
-                    "meta-llama/llama-3.3-70b-instruct:free"
+                    "meta-llama/llama-3.3-70b-instruct:free",
+                    "z-ai/glm-5.3-flash",
+                    "openrouter/free"
                 ]
             },
             messages=[{"role": "user", "content": user_text}],
@@ -91,4 +101,4 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling()
