@@ -233,7 +233,28 @@ async def process_ai_request(user_text: str, status_msg, update: Update):
             messages=[{"role": "user", "content": user_text}],
             stream=False
         )
-        reply = response.choices[0].message.content or "No response generated."
+        msg = response.choices[0].message
+        reply = msg.content
+
+        # 1. Handle native tool_calls from OpenRouter models
+        if not reply and getattr(msg, "tool_calls", None):
+            calls = []
+            for tc in msg.tool_calls:
+                fn_name = tc.function.name
+                args_raw = tc.function.arguments
+                calls.append(f"{fn_name}({args_raw})")
+            reply = f"<|tool_call_start|>[{', '.join(calls)}]<|tool_call_end|>"
+
+        # 2. Handle reasoning models (DeepSeek-R1) returning thought stream
+        if not reply:
+            reasoning = getattr(msg, "reasoning", None) or getattr(msg, "reasoning_content", None)
+            if not reasoning and hasattr(msg, "model_extra") and isinstance(msg.model_extra, dict):
+                reasoning = msg.model_extra.get("reasoning") or msg.model_extra.get("reasoning_content")
+            if reasoning:
+                reply = reasoning
+
+        if not reply:
+            reply = "No response generated."
 
         # Send response back to user
         if len(reply) <= 4000:
