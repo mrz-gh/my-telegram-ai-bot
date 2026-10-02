@@ -217,7 +217,7 @@ async def process_ai_request(user_text: str, status_msg, update: Update):
 
     try:
         # Check if a runtime model was specified via [MODEL:vendor/model] tag
-        selected_model = os.getenv("AI_MODEL", "deepseek/deepseek-r1:free")
+        selected_model = os.getenv("AI_MODEL", "openrouter/free")
         if user_text.startswith("[MODEL:") and "]" in user_text:
             tag, clean_text = user_text.split("]", 1)
             parsed_model = tag.replace("[MODEL:", "").strip()
@@ -225,11 +225,15 @@ async def process_ai_request(user_text: str, status_msg, update: Update):
                 selected_model = parsed_model
             user_text = clean_text.lstrip()
 
+        # If deprecated deepseek/deepseek-r1:free is requested, seamlessly route to openrouter/free
+        if selected_model == "deepseek/deepseek-r1:free":
+            selected_model = "openrouter/free"
+
         # Fallback candidates (OpenRouter enforces max 3 models total)
         fallback_pool = [
-            "deepseek/deepseek-r1:free",
+            "openrouter/free",
             "meta-llama/llama-3.3-70b-instruct:free",
-            "openrouter/free"
+            "google/gemini-2.0-flash-exp:free"
         ]
         fallbacks = [m for m in fallback_pool if m != selected_model][:2]
 
