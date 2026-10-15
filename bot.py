@@ -24,7 +24,7 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Messa
 from openai import AsyncOpenAI
 
 # --- Bot Version ---
-BOT_VERSION = os.getenv("BOT_VERSION", "v1.2.2")
+BOT_VERSION = os.getenv("BOT_VERSION", "v1.2.3")
 
 # --- 1. Dummy HTTP Server for Render Port Check ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -252,65 +252,68 @@ async def process_ai_request(user_text: str, status_msg, update: Update):
         ]
         fallbacks = [m for m in fallback_pool if m != selected_model][:2]
 
-        response = await ai_client.chat.completions.create(
-            model=selected_model,
-            extra_body={"models": fallbacks} if fallbacks else {},
-            messages=[{"role": "user", "content": user_text}],
-            stream=False
-        )
-        msg = response.choices[0].message
-        reply = msg.content
+        reply = None
+        last_err = None
+        max_attempts = 3
+        current_model = selected_model
 
-        # 1. Handle native tool_calls from OpenRouter models
-        if not reply and getattr(msg, "tool_calls", None):
-            calls = []
-            for tc in msg.tool_calls:
-                fn_name = tc.function.name
-                args_raw = tc.function.arguments
-                calls.append(f"{fn_name}({args_raw})")
-            reply = f"<|tool_call_start|>[{', '.join(calls)}]<|tool_call_end|>"
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = await ai_client.chat.completions.create(
+                    model=current_model,
+                    extra_body={"models": fallbacks} if fallbacks else {},
+                    messages=[{"role": "user", "content": user_text}],
+                    stream=False
+                )
+                msg = response.choices[0].message
+                candidate = msg.content
 
-        # 2. Handle reasoning models (DeepSeek-R1) returning thought stream
-        if not reply:
-            reasoning = getattr(msg, "reasoning", None) or getattr(msg, "reasoning_content", None)
-            if not reasoning and hasattr(msg, "model_extra") and isinstance(msg.model_extra, dict):
-                reasoning = msg.model_extra.get("reasoning") or msg.model_extra.get("reasoning_content")
-            if reasoning:
-                reply = reasoning
+                # 1. Handle native tool_calls from OpenRouter models
+                if not candidate and getattr(msg, "tool_calls", None):
+                    calls = []
+                    for tc in msg.tool_calls:
+                        fn_name = tc.function.name
+                        args_raw = tc.function.arguments
+                        calls.append(f"{fn_name}({args_raw})")
+                    candidate = f"<|tool_call_start|>[{', '.join(calls)}]<|tool_call_end|>"
 
-        # 3. Strip safety evaluation boilerplate if returned by upstream model
-        if reply:
-            reply = re.sub(
-                r"^(?:User Safety:\s*\w+\s*\n*|Response Safety:\s*\w+\s*\n*)+",
-                "",
-                reply.strip(),
-                flags=re.IGNORECASE
-            ).strip()
+                # 2. Handle reasoning models (DeepSeek-R1) returning thought stream
+                if not candidate:
+                    reasoning = getattr(msg, "reasoning", None) or getattr(msg, "reasoning_content", None)
+                    if not reasoning and hasattr(msg, "model_extra") and isinstance(msg.model_extra, dict):
+                        reasoning = msg.model_extra.get("reasoning") or msg.model_extra.get("reasoning_content")
+                    if reasoning:
+                        candidate = reasoning
 
-        # 4. If model returned only a safety check stub and nothing else, query fallback model
-        is_empty_or_safety_stub = not reply or bool(re.match(r"^(?:User Safety:\s*\w+|Response Safety:\s*\w+)+$", reply.strip(), re.IGNORECASE))
-        if is_empty_or_safety_stub:
-            for fallback_model in ["meta-llama/llama-3.3-70b-instruct:free", "google/gemini-2.0-flash-exp:free"]:
-                if fallback_model == selected_model:
-                    continue
-                try:
-                    fb_resp = await ai_client.chat.completions.create(
-                        model=fallback_model,
-                        messages=[{"role": "user", "content": user_text}],
-                        stream=False
-                    )
-                    fb_content = fb_resp.choices[0].message.content or ""
-                    clean_fb = re.sub(
+                # 3. Strip safety evaluation boilerplate if returned by upstream model
+                if candidate:
+                    candidate = re.sub(
                         r"^(?:User Safety:\s*\w+\s*\n*|Response Safety:\s*\w+\s*\n*)+",
                         "",
-                        fb_content.strip(),
+                        candidate.strip(),
                         flags=re.IGNORECASE
                     ).strip()
-                    if clean_fb:
-                        reply = clean_fb
-                        break
-                except Exception:
-                    continue
+
+                # 4. Check if valid response (not empty, not safety stub)
+                is_stub = bool(re.match(r"^(?:User Safety:\s*\w+|Response Safety:\s*\w+)+$", candidate.strip(), re.IGNORECASE)) if candidate else False
+                if candidate and not is_stub:
+                    reply = candidate
+                    break
+
+            except Exception as e:
+                last_err = e
+
+            # If empty response, stub, or exception: automatically retry sending query again!
+            if attempt < max_attempts:
+                if status_msg:
+                    try:
+                        await status_msg.edit_text(f"Thinking (retrying {attempt + 1}/{max_attempts})...")
+                    except Exception:
+                        pass
+                await asyncio.sleep(1.2)
+                # On final retry attempt, rotate to a reliable fallback candidate
+                if attempt == 2 and fallbacks:
+                    current_model = fallbacks[0]
 
         if not reply:
             reply = "No response generated."
