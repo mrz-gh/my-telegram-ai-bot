@@ -23,13 +23,16 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 from openai import AsyncOpenAI
 
+# --- Bot Version ---
+BOT_VERSION = os.getenv("BOT_VERSION", "v1.2.0")
+
 # --- 1. Dummy HTTP Server for Render Port Check ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Bot is alive!")
+        self.wfile.write(f"Bot is alive! [Bot {BOT_VERSION}]".encode("utf-8"))
 
     def log_message(self, format, *args):
         return
@@ -116,26 +119,14 @@ class MessageAggregator:
                 buf.total_parts = total
                 buf.parts[part_num] = content
 
-                # Status message feedback
-                status_text = f"⏳ Receiving multi-part prompt ({len(buf.parts)}/{total})..."
-                if not buf.status_msg:
-                    try:
-                        buf.status_msg = await update.message.reply_text(status_text)
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        await buf.status_msg.edit_text(status_text)
-                    except Exception:
-                        pass
-
-                # If all parts arrived, dispatch immediately
+                # Buffer chunk part without sending premature reply between parts
                 if len(buf.parts) == total:
+                    # All parts arrived! Cancel timeout and dispatch combined prompt
                     if buf.timer_task and not buf.timer_task.done():
                         buf.timer_task.cancel()
                     asyncio.create_task(self.dispatch(buf))
                 else:
-                    # Reset safety fallback timer (in case a chunk is dropped)
+                    # Waiting for remaining parts; set safety timeout
                     if buf.timer_task and not buf.timer_task.done():
                         buf.timer_task.cancel()
                     buf.timer_task = asyncio.create_task(self._wait_and_dispatch(buf, self.part_timeout))
@@ -266,6 +257,9 @@ async def process_ai_request(user_text: str, status_msg, update: Update):
         if not reply:
             reply = "No response generated."
 
+        # Append version tag so active deployment version is visible in every response
+        reply = f"{reply}\n\n[Bot {BOT_VERSION}]"
+
         # Send response back to user
         if len(reply) <= 4000:
             if status_msg:
@@ -283,7 +277,7 @@ async def process_ai_request(user_text: str, status_msg, update: Update):
 
     except Exception as e:
         # Return every error message as it is so local client (api_server / ask_ai) can log and inspect it
-        err_text = f"Error processing request: {e}"
+        err_text = f"Error processing request [Bot {BOT_VERSION}]: {e}"
         if status_msg:
             try:
                 await status_msg.edit_text(err_text)
@@ -302,7 +296,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "👋 **Bot connected!**\n\n"
+        f"👋 **Bot connected!** [Bot `{BOT_VERSION}`]\n\n"
         "Send me any prompt to begin. Multi-message prompts are automatically buffered and assembled.",
         parse_mode="Markdown"
     )
