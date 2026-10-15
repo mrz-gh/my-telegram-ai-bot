@@ -24,7 +24,7 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Messa
 from openai import AsyncOpenAI
 
 # --- Bot Version ---
-BOT_VERSION = os.getenv("BOT_VERSION", "v1.2.0")
+BOT_VERSION = os.getenv("BOT_VERSION", "v1.2.2")
 
 # --- 1. Dummy HTTP Server for Render Port Check ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -83,11 +83,12 @@ class MessageAggregator:
     Buffers and stitches incoming message chunks before querying the AI model.
     Handles:
     1. Explicit chunk markers: e.g. [PART 1/3] ... [PART 2/3] ... [PART 3/3]
-    2. Silence debounce: combines messages received within a 1.2-second window.
+       Waits until ALL parts arrive. Does NOT timeout automatically.
+    2. Silence debounce: combines rapid un-chunked messages received within a 1.2s window.
+    3. Manual reset: /restart or 'restart' clears any stuck/buffered state immediately.
     """
-    def __init__(self, debounce_delay: float = 1.2, part_timeout: float = 10.0):
+    def __init__(self, debounce_delay: float = 1.2):
         self.debounce_delay = debounce_delay
-        self.part_timeout = part_timeout
         self.buffers: Dict[int, UserBuffer] = {}
         self.manager_lock = asyncio.Lock()
 
@@ -97,6 +98,17 @@ class MessageAggregator:
                 self.buffers[user_id] = UserBuffer(user_id)
             return self.buffers[user_id]
 
+    async def reset_user(self, user_id: int):
+        """Clear all buffered message parts and cancel timers for the user."""
+        buf = await self.get_buffer(user_id)
+        async with buf.lock:
+            if buf.timer_task and not buf.timer_task.done():
+                buf.timer_task.cancel()
+            buf.parts.clear()
+            buf.raw_chunks.clear()
+            buf.total_parts = None
+            buf.status_msg = None
+
     async def handle_incoming(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if not is_authorized(user_id):
@@ -104,6 +116,17 @@ class MessageAggregator:
             return
 
         text = update.message.text or ""
+
+        # Instant reset command trigger (plain text or slash command)
+        if text.strip().lower() in ("/restart", "restart", "/reset", "reset"):
+            await self.reset_user(user_id)
+            await update.message.reply_text(
+                f"🔄 **Buffer reset!** All pending parts cleared.\n"
+                f"Ready for new messages. [Bot {BOT_VERSION}]",
+                parse_mode="Markdown"
+            )
+            return
+
         buf = await self.get_buffer(user_id)
 
         async with buf.lock:
@@ -116,20 +139,21 @@ class MessageAggregator:
                 total = int(part_match.group(2))
                 content = part_match.group(3)
 
+                # If starting fresh with Part 1, clear any leftover incomplete parts
+                if part_num == 1 and buf.parts and len(buf.parts) < (buf.total_parts or 0):
+                    buf.parts.clear()
+
                 buf.total_parts = total
                 buf.parts[part_num] = content
 
-                # Buffer chunk part without sending premature reply between parts
+                # Dispatch ONLY when ALL parts have arrived! (No timeout, waits patiently)
                 if len(buf.parts) == total:
-                    # All parts arrived! Cancel timeout and dispatch combined prompt
                     if buf.timer_task and not buf.timer_task.done():
                         buf.timer_task.cancel()
                     asyncio.create_task(self.dispatch(buf))
                 else:
-                    # Waiting for remaining parts; set safety timeout
-                    if buf.timer_task and not buf.timer_task.done():
-                        buf.timer_task.cancel()
-                    buf.timer_task = asyncio.create_task(self._wait_and_dispatch(buf, self.part_timeout))
+                    # Still waiting for remaining parts. No timer, no premature dispatch.
+                    pass
 
             else:
                 # Debounce window mode for rapid sequential messages
@@ -184,7 +208,7 @@ class MessageAggregator:
 
 
 # Global Aggregator Singleton
-aggregator = MessageAggregator(debounce_delay=1.2, part_timeout=10.0)
+aggregator = MessageAggregator(debounce_delay=1.2)
 
 
 # --- 4. OpenRouter Query & Response Delivery ---
@@ -254,6 +278,40 @@ async def process_ai_request(user_text: str, status_msg, update: Update):
             if reasoning:
                 reply = reasoning
 
+        # 3. Strip safety evaluation boilerplate if returned by upstream model
+        if reply:
+            reply = re.sub(
+                r"^(?:User Safety:\s*\w+\s*\n*|Response Safety:\s*\w+\s*\n*)+",
+                "",
+                reply.strip(),
+                flags=re.IGNORECASE
+            ).strip()
+
+        # 4. If model returned only a safety check stub and nothing else, query fallback model
+        is_empty_or_safety_stub = not reply or bool(re.match(r"^(?:User Safety:\s*\w+|Response Safety:\s*\w+)+$", reply.strip(), re.IGNORECASE))
+        if is_empty_or_safety_stub:
+            for fallback_model in ["meta-llama/llama-3.3-70b-instruct:free", "google/gemini-2.0-flash-exp:free"]:
+                if fallback_model == selected_model:
+                    continue
+                try:
+                    fb_resp = await ai_client.chat.completions.create(
+                        model=fallback_model,
+                        messages=[{"role": "user", "content": user_text}],
+                        stream=False
+                    )
+                    fb_content = fb_resp.choices[0].message.content or ""
+                    clean_fb = re.sub(
+                        r"^(?:User Safety:\s*\w+\s*\n*|Response Safety:\s*\w+\s*\n*)+",
+                        "",
+                        fb_content.strip(),
+                        flags=re.IGNORECASE
+                    ).strip()
+                    if clean_fb:
+                        reply = clean_fb
+                        break
+                except Exception:
+                    continue
+
         if not reply:
             reply = "No response generated."
 
@@ -297,7 +355,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"👋 **Bot connected!** [Bot `{BOT_VERSION}`]\n\n"
-        "Send me any prompt to begin. Multi-message prompts are automatically buffered and assembled.",
+        "Send me any prompt to begin. Multi-part prompts are buffered until all parts arrive.\n\n"
+        "💡 *If ever stuck on an incomplete multi-part prompt, send `/restart` to reset the buffer.*",
+        parse_mode="Markdown"
+    )
+
+async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /restart or /reset to clear buffered parts."""
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        await update.message.reply_text(f"⛔ Unauthorized. Your User ID is: `{user_id}`", parse_mode="Markdown")
+        return
+    await aggregator.reset_user(user_id)
+    await update.message.reply_text(
+        f"🔄 **Buffer reset!** All pending parts cleared.\n"
+        f"Ready for new messages. [Bot {BOT_VERSION}]",
         parse_mode="Markdown"
     )
 
@@ -313,5 +385,7 @@ if __name__ == "__main__":
     # Start Telegram bot
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("restart", restart))
+    app.add_handler(CommandHandler("reset", restart))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
